@@ -21,20 +21,38 @@ jobs:
     outputs:
       android: ${{ steps.find.outputs.android }}
       backend: ${{ steps.find.outputs.backend }}
+      zip: ${{ steps.find.outputs.zip }}
     steps:
       - uses: actions/checkout@v4
       - id: find
         run: |
           echo "Cấu trúc repo (3 cấp):"
           find . -maxdepth 3 -not -path './.git' -not -path './.git/*' | sort
-          android=$(find . -name settings.gradle.kts -not -path './.git/*' -not -path '*/build/*' | sort | head -n1 | xargs -r dirname)
-          backend=$(find . -path '*/backend/requirements.txt' -not -path './.git/*' | sort | head -n1 | xargs -r dirname)
+          find_android() { find "$1" -name settings.gradle.kts -not -path '*/.git/*' -not -path '*/build/*' | sort | head -n1 | xargs -r dirname; }
+          find_backend() { find "$1" -path '*/backend/requirements.txt' -not -path '*/.git/*' | sort | head -n1 | xargs -r dirname; }
+          android=$(find_android .)
+          backend=$(find_backend .)
+          zip=""
+          if [ -z "$android" ]; then
+            # Trường hợp tải nguyên file source.zip lên repo: giải nén rồi tìm lại
+            for z in $(find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' | sort); do
+              if unzip -l "$z" | grep -q 'settings.gradle.kts'; then
+                zip="$z"
+                echo "Tìm thấy dự án trong file nén: $z → giải nén vào _src/"
+                unzip -q -o "$z" -d _src
+                android=$(find_android _src)
+                backend=$(find_backend _src)
+                break
+              fi
+            done
+          fi
           echo "android=${android}" >> "$GITHUB_OUTPUT"
           echo "backend=${backend}" >> "$GITHUB_OUTPUT"
+          echo "zip=${zip}" >> "$GITHUB_OUTPUT"
           echo "Android project: ${android:-KHÔNG TÌM THẤY}"
           echo "Backend:         ${backend:-không có}"
           if [ -z "$android" ]; then
-            echo "::error::Không tìm thấy settings.gradle.kts trong repo. Hãy đẩy TOÀN BỘ nội dung source.zip (app/, gradle/, gradlew, settings.gradle.kts, build.gradle.kts, gradle.properties, backend/) lên repo."
+            echo "::error::Không tìm thấy settings.gradle.kts (kể cả trong file .zip). Hãy giải nén source.zip và đẩy TOÀN BỘ nội dung (app/, gradle/, gradlew, settings.gradle.kts, build.gradle.kts, gradle.properties, backend/) lên repo."
             exit 1
           fi
 
@@ -46,6 +64,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Extract source zip
+        if: needs.locate.outputs.zip != ''
+        run: unzip -q -o "${{ needs.locate.outputs.zip }}" -d _src
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -70,6 +91,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Extract source zip
+        if: needs.locate.outputs.zip != ''
+        run: unzip -q -o "${{ needs.locate.outputs.zip }}" -d _src
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
