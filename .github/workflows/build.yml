@@ -14,26 +14,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Tự tìm thư mục dự án (repo có thể chứa mã nguồn trong thư mục con)
+  locate:
+    name: Locate project
+    runs-on: ubuntu-latest
+    outputs:
+      android: ${{ steps.find.outputs.android }}
+      backend: ${{ steps.find.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: find
+        run: |
+          echo "Cấu trúc repo (3 cấp):"
+          find . -maxdepth 3 -not -path './.git' -not -path './.git/*' | sort
+          android=$(find . -name settings.gradle.kts -not -path './.git/*' -not -path '*/build/*' | sort | head -n1 | xargs -r dirname)
+          backend=$(find . -path '*/backend/requirements.txt' -not -path './.git/*' | sort | head -n1 | xargs -r dirname)
+          echo "android=${android}" >> "$GITHUB_OUTPUT"
+          echo "backend=${backend}" >> "$GITHUB_OUTPUT"
+          echo "Android project: ${android:-KHÔNG TÌM THẤY}"
+          echo "Backend:         ${backend:-không có}"
+          if [ -z "$android" ]; then
+            echo "::error::Không tìm thấy settings.gradle.kts trong repo. Hãy đẩy TOÀN BỘ nội dung source.zip (app/, gradle/, gradlew, settings.gradle.kts, build.gradle.kts, gradle.properties, backend/) lên repo."
+            exit 1
+          fi
+
   backend-tests:
     name: Backend tests (Provisioning API)
+    needs: locate
+    if: needs.locate.outputs.backend != ''
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: backend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -r requirements.txt
-      - run: python -m pytest -q
+      - working-directory: ${{ needs.locate.outputs.backend }}
+        run: |
+          pip install -r requirements.txt
+          python -m pytest -q
 
   android:
     name: Android APK
+    needs: locate
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
+      PROJECT_DIR: ${{ needs.locate.outputs.android }}
       HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
       # Khóa công khai xác minh cấu hình WireGuard (không bí mật) và địa chỉ Provisioning API mặc định
       CONFIG_SIGNING_PUBLIC_KEY: ${{ vars.CONFIG_SIGNING_PUBLIC_KEY }}
@@ -50,18 +77,30 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Cài sẵn Gradle 8.11.1 để vẫn build được nếu gradlew / gradle-wrapper.jar bị thiếu khi tải lên
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
 
       - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace assembleDebug
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            GRADLE=./gradlew
+          else
+            echo "::warning::Thiếu gradlew hoặc gradle/wrapper/gradle-wrapper.jar – dùng Gradle 8.11.1 cài sẵn."
+            GRADLE=gradle
+          fi
+          echo "GRADLE=$GRADLE" >> "$GITHUB_ENV"
+          $GRADLE --no-daemon --stacktrace assembleDebug
 
       - name: Rename APK
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          mkdir -p out
-          cp app/build/outputs/apk/debug/app-debug.apk "out/PersonalSecuritySuite-debug-${{ github.run_number }}.apk"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/out/PersonalSecuritySuite-debug-${{ github.run_number }}.apk"
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
@@ -77,19 +116,20 @@ jobs:
 
       - name: Build signed release APK
         if: env.HAS_KEYSTORE == 'true'
+        working-directory: ${{ env.PROJECT_DIR }}
         env:
           SIGNING_KEYSTORE_PATH: ${{ runner.temp }}/release.jks
           SIGNING_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew --no-daemon --stacktrace assembleRelease
+        run: $GRADLE --no-daemon --stacktrace assembleRelease
 
       - name: Upload release APK
         if: env.HAS_KEYSTORE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: PersonalSecuritySuite-release-${{ github.run_number }}
-          path: app/build/outputs/apk/release/*.apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
 
       # Build lỗi: lưu báo cáo để chẩn đoán
       - name: Upload build reports
@@ -98,6 +138,6 @@ jobs:
         with:
           name: build-reports-${{ github.run_number }}
           path: |
-            app/build/reports/
-            app/build/outputs/logs/
+            ${{ env.PROJECT_DIR }}/app/build/reports/
+            ${{ env.PROJECT_DIR }}/app/build/outputs/logs/
           if-no-files-found: ignore
